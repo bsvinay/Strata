@@ -3,14 +3,24 @@
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+// Local patch: on HIP (ROCm 6+, not the gfx906 compat build) the same segmented cache runs on HIP's virtual memory
+// management (hipMemCreate / hipMemMap / hipMemUnmap ...), verified on gfx1100 with ROCm 10.1.
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
 #define STRATA_EC_NO_VMM 1
+#elif defined(STRATA_USE_HIP)
+#include <hip/hip_runtime.h>
+#include <hip/hip_version.h>
+#if defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 6
+#define STRATA_EC_HIP_VMM 1
+#else
+#define STRATA_EC_NO_VMM 1
+#endif
 #endif
 
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
-#if !defined(STRATA_EC_NO_VMM)
+#if !defined(STRATA_EC_NO_VMM) && !defined(STRATA_EC_HIP_VMM)
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
 #endif
 
@@ -216,7 +226,57 @@ ExpertCache::~ExpertCache() { close(); }
 // ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
 // runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
 // and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
-#if !defined(STRATA_EC_NO_VMM)
+#if defined(STRATA_EC_HIP_VMM)
+namespace {
+// The CUDA driver names the code below uses, as HIP's: same calls, same semantics.
+using CUresult = hipError_t;
+using CUdevice = int;
+using CUdeviceptr = unsigned long long;
+using CUmemAllocationProp = hipMemAllocationProp;
+using CUmemAccessDesc = hipMemAccessDesc;
+using CUmemGenericAllocationHandle = hipMemGenericAllocationHandle_t;
+constexpr hipError_t CUDA_SUCCESS = hipSuccess;
+constexpr auto CU_MEM_ALLOCATION_TYPE_PINNED = hipMemAllocationTypePinned;
+constexpr auto CU_MEM_LOCATION_TYPE_DEVICE = hipMemLocationTypeDevice;
+constexpr auto CU_MEM_ACCESS_FLAGS_PROT_READWRITE = hipMemAccessFlagsProtReadWrite;
+constexpr auto CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = hipMemAllocationGranularityRecommended;
+constexpr auto CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = hipDeviceAttributeVirtualMemoryManagementSupported;
+struct Vmm {
+    bool ok = true;
+    CUresult device_get(CUdevice* d, int ordinal) const { *d = ordinal; return hipSuccess; }
+    CUresult attribute(int* v, hipDeviceAttribute_t a, CUdevice d) const { return hipDeviceGetAttribute(v, a, d); }
+    CUresult granularity(size_t* g, const CUmemAllocationProp* p, hipMemAllocationGranularity_flags f) const {
+        return hipMemGetAllocationGranularity(g, p, f);
+    }
+    CUresult reserve(CUdeviceptr* va, size_t n, size_t align, CUdeviceptr addr, unsigned long long flags) const {
+        void* p = nullptr;
+        const hipError_t e = hipMemAddressReserve(&p, n, align, reinterpret_cast<void*>(addr), flags);
+        *va = reinterpret_cast<CUdeviceptr>(p);
+        return e;
+    }
+    CUresult address_free(CUdeviceptr va, size_t n) const { return hipMemAddressFree(reinterpret_cast<void*>(va), n); }
+    CUresult create(CUmemGenericAllocationHandle* h, size_t n, const CUmemAllocationProp* p, unsigned long long f) const {
+        return hipMemCreate(h, n, p, f);
+    }
+    CUresult release(CUmemGenericAllocationHandle h) const { return hipMemRelease(h); }
+    CUresult map(CUdeviceptr va, size_t n, size_t off, CUmemGenericAllocationHandle h, unsigned long long f) const {
+        return hipMemMap(reinterpret_cast<void*>(va), n, off, h, f);
+    }
+    CUresult unmap(CUdeviceptr va, size_t n) const { return hipMemUnmap(reinterpret_cast<void*>(va), n); }
+    CUresult set_access(CUdeviceptr va, size_t n, const CUmemAccessDesc* d, size_t count) const {
+        return hipMemSetAccess(reinterpret_cast<void*>(va), n, d, count);
+    }
+};
+const Vmm& vmm() {
+    static const Vmm v = [] {
+        Vmm x;
+        const char* off = std::getenv("STRATA_HIP_VMM");   // the same switch as the elastic K/V's: 0 = never
+        x.ok = !(off != nullptr && off[0] == '0');
+        return x;
+    }();
+    return v;
+}
+#elif !defined(STRATA_EC_NO_VMM)
 namespace {
 struct Vmm {
     CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
@@ -261,6 +321,8 @@ const Vmm& vmm() {
     }();
     return v;
 }
+#endif
+#if !defined(STRATA_EC_NO_VMM)
 
 CUmemAllocationProp device_prop(int dev) {
     CUmemAllocationProp prop{};
