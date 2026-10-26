@@ -3448,30 +3448,6 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
         bytes += trim(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i]);
     }
     return bytes;
-#elif defined(__linux__)
-    // Local patch (STRATA_FILE_COLD=1, opt-in): an expert now held in VRAM does not need its pages of the mapped model
-    // file; MADV_COLD moves them to the inactive list, so under memory pressure the kernel takes them back before the
-    // pages of the experts the GPU does not hold (which every prompt reads).  Nothing is dropped while memory is free.
-    // Without it, a VRAM grow (#533) that refills the cache through the mapping leaves ~the whole cache's pages hot,
-    // and on a host short of RAM the prompt path then re-reads the off-card experts from disk on every request.
-    static const bool cold = [] { const char* v = std::getenv("STRATA_FILE_COLD"); return v != nullptr && v[0] == '1'; }();
-    if (!cold || base_ == nullptr || unmapped_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
-        return 0;
-#ifndef MADV_COLD
-#define MADV_COLD 20
-#endif
-    auto advise = [](const uint8_t* p, uint64_t bytes) -> uint64_t {
-        const uint64_t pg = 4096, a = ((uintptr_t) p + pg - 1) / pg * pg, e = ((uintptr_t) p + bytes) / pg * pg;
-        if (p == nullptr || e <= a) return 0;
-        return madvise((void*) (uintptr_t) a, (size_t) (e - a), MADV_COLD) == 0 ? e - a : 0;
-    };
-    if (role_ptr_.empty()) return advise(mapped_blob(layer, expert), layer_blob_bytes_[(size_t) layer]);
-    uint64_t bytes = 0;
-    for (int r = 0; r < 3; ++r) {
-        const size_t i = (size_t) (3 * layer + r);
-        bytes += advise(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i]);
-    }
-    return bytes;
 #else
     (void) layer; (void) expert;
     return 0;

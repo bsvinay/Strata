@@ -11307,7 +11307,6 @@ int main(int argc, char** argv) {
                 const int64_t live = xcache.slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
-                std::vector<int64_t> refilled;   // local patch: their mapped pages are released once the copies land
                 for (const auto& [i, slot] : vram_evicted) {
                     if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
@@ -11331,12 +11330,9 @@ int main(int argc, char** argv) {
                     }
                     srcp->note_async_read(b, nullptr);   // #1237: the queued copy reads a stage buffer; it is not recycled under it
                     host_res[(size_t) pick] = slot;
-                    refilled.push_back(pick);
                 }
                 vram_evicted.swap(keep_out);
                 if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
-                // as the start does for the experts it put in VRAM ("handed back to the OS"): the RAM copy is not needed
-                for (const int64_t j : refilled) srcp->release(j / g.n_expert, j % g.n_expert);
                 res_upload();
             }
             relend();
