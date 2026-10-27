@@ -7035,8 +7035,8 @@ int main(int argc, char** argv) {
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
-#if defined(STRATA_USE_HIP)
-        if (why == nullptr) why = "it is NVIDIA-only for now";
+#if defined(STRATA_HIP_GFX906) || (defined(STRATA_USE_HIP) && (!defined(HIP_VERSION_MAJOR) || HIP_VERSION_MAJOR < 6))
+        if (why == nullptr) why = "it needs HIP 6 or newer (not the gfx906 build)";
 #endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --vram-elastic is off: %s\n", why);
